@@ -106,7 +106,8 @@ class NotifyMixin(object):
 
         # Update payload with all other kwargs
         payload.update(kwargs)
-        LOG.debug('Sending event: %s, %s' % (event_type, payload))
+        LOG.debug('Sending event: %s, %s' % (event_type, payload),
+                  instance_uuid=self.id)
         notifier.notify(self.context, publisher_id, event_type, 'INFO',
                         payload)
 
@@ -128,6 +129,7 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
     def create_instance(self, flavor, image_id, databases, users,
                         service_type, volume_size, security_groups,
                         backup_id):
+        LOG.debug("Starting create_instance", instance_uuid=self.id)
         if use_nova_server_volume:
             server, volume_info = self._create_server_volume(
                 flavor['id'],
@@ -148,6 +150,9 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
             msg = "Error creating DNS entry for instance: %s" % self.id
             err = inst_models.InstanceTasks.BUILDING_ERROR_DNS
             self._log_and_raise(e, msg, err)
+        else:
+            LOG.debug(_("Successfully created DNS entry for instance: %s") %
+                      self.id, instance_uuid=self.id)
 
         config = self._render_config(service_type, flavor)
 
@@ -168,10 +173,18 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
                              time_out=USAGE_TIMEOUT)
             self.send_usage_event('create', instance_size=flavor['ram'])
         except PollTimeOut:
-            LOG.error("Timeout for service changing to active. "
-                      "No usage create-event sent.")
+            LOG.error(_("Timeout for service changing to active. "
+                        "No usage create-event sent for instance: %s") %
+                      self.id, instance_uuid=self.id)
         except Exception:
-            LOG.exception("Error during create-event call.")
+            LOG.exception(_("Error during create-event call for "
+                            "instance: %s") %
+                          self.id, instance_uuid=self.id)
+        else:
+            LOG.info(_("SUCCESS created instance %s") %
+                     self.id, instance_uuid=self.id)
+        finally:
+            LOG.debug("End create_instance", instance_uuid=self.id)
 
     def _service_is_active(self):
         """
@@ -196,7 +209,8 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
         nova_status = self.nova_client.servers.get(c_id).status
         if nova_status in [InstanceStatus.ERROR,
                            InstanceStatus.FAILED]:
-            raise TroveError("Server not active, status: %s" % nova_status)
+            raise TroveError("Server not active for instance %s, status: %s" %
+                            (self.id, nova_status))
         return False
 
     def _create_server_volume(self, flavor_id, image_id, security_groups,
@@ -216,10 +230,12 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
                 name, image_id, flavor_id,
                 files=files, volume=volume_ref,
                 security_groups=security_groups)
-            LOG.debug(_("Created new compute instance %s.") % server.id)
+            LOG.debug(_("Created new compute instance %s") % server.id,
+                      instance_id=self.id)
 
             server_dict = server._info
-            LOG.debug("Server response: %s" % server_dict)
+            LOG.debug("Server response: %s" % server_dict,
+                      instance_uuid=self.id)
             volume_id = None
             for volume in server_dict.get('os:volumes', []):
                 volume_id = volume.get('id')
@@ -227,7 +243,7 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
             # Record the server ID and volume ID in case something goes wrong.
             self.update_db(compute_instance_id=server.id, volume_id=volume_id)
         except Exception as e:
-            msg = "Error creating server and volume for instance."
+            msg = "Error creating server and volume for instance: %s" % self.id
             err = inst_models.InstanceTasks.BUILDING_ERROR_SERVER
             self._log_and_raise(e, msg, err)
 
@@ -250,7 +266,7 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
             # Save server ID.
             self.update_db(compute_instance_id=server_id)
         except Exception as e:
-            msg = "Error creating server for instance."
+            msg = "Error creating server for instance: %s" % self.id
             err = inst_models.InstanceTasks.BUILDING_ERROR_SERVER
             self._log_and_raise(e, msg, err)
         return server, volume_info
@@ -258,12 +274,13 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
     def _build_volume_info(self, volume_size=None):
         volume_info = None
         volume_support = CONF.trove_volume_support
-        LOG.debug(_("trove volume support = %s") % volume_support)
+        LOG.debug(_("trove volume support = %s") % volume_support,
+                  instance_uuid=self.id)
         if volume_support:
             try:
                 volume_info = self._create_volume(volume_size)
             except Exception as e:
-                msg = "Error provisioning volume for instance."
+                msg = "Error provisioning volume for instance %s" % self.id
                 err = inst_models.InstanceTasks.BUILDING_ERROR_VOLUME
                 self._log_and_raise(e, msg, err)
         else:
@@ -278,15 +295,16 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
         return volume_info
 
     def _log_and_raise(self, exc, message, task_status):
-        LOG.error(message)
+        LOG.error(message, instance_uuid=self.id)
         LOG.error(exc)
         LOG.error(traceback.format_exc())
         self.update_db(task_status=task_status)
         raise TroveError(message=message)
 
     def _create_volume(self, volume_size):
-        LOG.info("Entering create_volume")
-        LOG.debug(_("Starting to create the volume for the instance"))
+        #LOG.info(_("Entering create_volume"), instance_uuid=self.id)
+        LOG.debug(_("Starting create_volume for instance %s") %
+                  self.id, instance_uuid=self.id)
 
         volume_client = create_cinder_client(self.context)
         volume_desc = ("mysql volume for %s" % self.id)
@@ -304,8 +322,10 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
 
         v_ref = volume_client.volumes.get(volume_ref.id)
         if v_ref.status in ['error']:
-            raise VolumeCreationFailure()
-        LOG.debug(_("Created volume %s") % v_ref)
+            raise VolumeCreationFailure('Error creating volume'
+                                        ' for instance: %s' % self.id)
+        LOG.debug(_("Created volume %s for instance %s") % (v_ref, self.id),
+                  instance_uuid=self.id)
         # The mapping is in the format:
         # <id>:[<type>]:[<size(GB)>]:[<delete_on_terminate>]
         # setting the delete_on_terminate instance to true=1
@@ -314,22 +334,26 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
         block_device = {bdm: mapping}
         volumes = [{'id': v_ref.id,
                     'size': v_ref.size}]
-        LOG.debug("block_device = %s" % block_device)
-        LOG.debug("volume = %s" % volumes)
+        LOG.debug(_("block_device = %s") % block_device, instance_uuid=self.id)
+        LOG.debug(_("volume = %s") % volumes, instance_uuid=self.id)
 
         device_path = CONF.device_path
         mount_point = CONF.mount_point
-        LOG.debug(_("device_path = %s") % device_path)
-        LOG.debug(_("mount_point = %s") % mount_point)
+        LOG.debug(_("device_path = %s") % device_path, instance_uuid=self.id)
+        LOG.debug(_("mount_point = %s") % mount_point, instance_uuid=self.id)
 
         volume_info = {'block_device': block_device,
                        'device_path': device_path,
                        'mount_point': mount_point,
                        'volumes': volumes}
+        LOG.debug(_("Exiting create_volume the volume for "
+                    "instance %s") % self.id, instance_uuid=self.id)
         return volume_info
 
     def _create_server(self, flavor_id, image_id, security_groups,
                        service_type, block_device_mapping):
+        LOG.debug(_("Starting create_server for instance %s.") %
+                  self.id, instance_uuid=self.id)
         files = {"/etc/guest_info": ("[DEFAULT]\nguest_id=%s\n"
                                      "service_type=%s\n" %
                                      (self.id, service_type))}
@@ -347,13 +371,15 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
         server = self.nova_client.servers.create(
             name, image_id, flavor_id, files=files, userdata=userdata,
             security_groups=security_groups, block_device_mapping=bdmap)
-        LOG.debug(_("Created new compute instance %s.") % server.id)
+        LOG.debug(_("Created new compute instance %s for instance %s") %
+                  (server.id, self.id), instance_uuid=self.id)
         return server
 
     def _guest_prepare(self, server, flavor_ram, volume_info,
                        databases, users, backup_id=None,
                        config_contents=None):
-        LOG.info("Entering guest_prepare.")
+        LOG.debug(_("Entering guest_prepare for instance %s") %
+                  self.id, instance_uuid=self.id)
         # Now wait for the response from the create to do additional work
         self.guest.prepare(flavor_ram, databases, users,
                            device_path=volume_info['device_path'],
@@ -363,9 +389,10 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
 
     def _create_dns_entry(self):
         LOG.debug("%s: Creating dns entry for instance: %s" %
-                  (greenthread.getcurrent(), self.id))
+                  (greenthread.getcurrent(), self.id), instance_uuid=self.id)
         dns_support = CONF.trove_dns_support
-        LOG.debug(_("trove dns support = %s") % dns_support)
+        LOG.debug(_("trove dns support = %s") %
+                  dns_support, instance_uuid=self.id)
 
         if dns_support:
             dns_client = create_dns_client(self.context)
@@ -375,7 +402,8 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
                 return self.nova_client.servers.get(c_id)
 
             def ip_is_available(server):
-                LOG.info("Polling for ip addresses: $%s " % server.addresses)
+                LOG.debug(_("Polling for ip addresses: $%s ") %
+                          (server.addresses), instance_uuid=self.id)
                 if server.addresses != {}:
                     return True
                 elif (server.addresses == {} and
@@ -383,20 +411,20 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
                     return False
                 elif (server.addresses == {} and
                       server.status == InstanceStatus.ERROR):
-                    msg = _("Instance IP not available, instance (%s): "
-                            "server had status (%s).")
-                    LOG.error(msg % (self.id, server.status))
+                    LOG.error(_("Instance IP not available, instance (%s): "
+                                "server had status (%s).") %
+                               (self.id, server.status))
                     raise TroveError(status=server.status)
 
             poll_until(get_server, ip_is_available,
                        sleep_time=1, time_out=DNS_TIME_OUT)
             server = self.nova_client.servers.get(
                 self.db_info.compute_instance_id)
-            LOG.info("Creating dns entry...")
+            LOG.info(_("Creating dns entry..."), instance_uuid=self.id)
             dns_client.create_instance_entry(self.id,
                                              get_ip_address(server.addresses))
         else:
-            LOG.debug("%s: DNS not enabled for instance: %s" %
+            LOG.debug(_("%s: DNS not enabled for instance: %s") %
                       (greenthread.getcurrent(), self.id))
 
 
@@ -419,8 +447,8 @@ class BuiltInstanceTasks(BuiltInstance, NotifyMixin, ConfigurationMixin):
         try:
             self.server.delete()
         except Exception as ex:
-            LOG.error("Error during delete compute server %s "
-                      % self.server.id)
+            LOG.error("Error during delete compute server %s for instance: %s"
+                      % (self.server.id, self.db_info.id))
             LOG.error(ex)
         try:
             dns_support = CONF.trove_dns_support
@@ -429,7 +457,7 @@ class BuiltInstanceTasks(BuiltInstance, NotifyMixin, ConfigurationMixin):
                 dns_api = create_dns_client(self.context)
                 dns_api.delete_instance_entry(instance_id=self.db_info.id)
         except Exception as ex:
-            LOG.error("Error during dns entry for instance %s "
+            LOG.error("Error during removal of dns entry for instance %s "
                       % self.db_info.id)
             LOG.error(ex)
             # Poll until the server is gone.
@@ -449,7 +477,7 @@ class BuiltInstanceTasks(BuiltInstance, NotifyMixin, ConfigurationMixin):
             poll_until(server_is_finished, sleep_time=2,
                        time_out=CONF.server_delete_time_out)
         except PollTimeOut as e:
-            LOG.error("Timout during nova server delete", e)
+            LOG.error("Timeout during nova server delete", e)
         self.send_usage_event('delete',
                               deleted_at=timeutils.isotime(deleted_at),
                               server=old_server)
@@ -465,8 +493,8 @@ class BuiltInstanceTasks(BuiltInstance, NotifyMixin, ConfigurationMixin):
         except cinder_exceptions.ClientException:
             self.update_db(task_status=inst_models.InstanceTasks.NONE)
             LOG.exception("Error encountered trying to rescan or resize the "
-                          "attached volume filesystem for volume: "
-                          "%s" % self.volume_id)
+                          "attached volume filesystem for instance %s on "
+                          "volume: %s" % (self.id, self.volume_id))
             raise
 
         try:
@@ -494,6 +522,9 @@ class BuiltInstanceTasks(BuiltInstance, NotifyMixin, ConfigurationMixin):
                       % self.volume_id)
         finally:
             self.update_db(task_status=inst_models.InstanceTasks.NONE)
+            LOG.debug("Resize complete on volume for instance: "
+                      "%s from %s to %r GB" %
+                      (self.server.id, old_volume_size, new_size))
 
     def resize_flavor(self, old_flavor, new_flavor):
         action = ResizeAction(self, old_flavor, new_flavor)
@@ -642,8 +673,11 @@ class ResizeActionBase(ConfigurationMixin):
     def _assert_nova_status_is_ok(self):
         # Make sure Nova thinks things went well.
         if self.instance.server.status != "VERIFY_RESIZE":
-            msg = "Migration failed! status=%s and not %s" \
-                  % (self.instance.server.status, 'VERIFY_RESIZE')
+            msg = "Migration failed! " \
+                  " instance %s status=%s and not %s" % \
+                (self.instance.id,
+                    self.instance.server.status,
+                    'VERIFY_RESIZE')
             raise TroveError(msg)
 
     def _assert_mysql_is_ok(self):
@@ -653,16 +687,17 @@ class ResizeActionBase(ConfigurationMixin):
         # The guest should do this for us... but sometimes it walks funny.
         self.instance._refresh_compute_service_status()
         if self.instance.service_status != ServiceStatuses.RUNNING:
-            raise Exception("Migration failed! Service status was %s."
-                            % self.instance.service_status)
+            raise Exception("Migration failed! Service status "
+                            "for instance %s was %s." %
+                            (self.instance.id, self.instance.service_status))
 
     def _assert_processes_are_ok(self):
         """Checks the procs; if anything is wrong, reverts the operation."""
         # Tell the guest to turn back on, and make sure it can start.
         self._assert_guest_is_ok()
-        LOG.debug("Nova guest is fine.")
+        LOG.debug("Nova guest is fine for instance: %s" % self.instance.id)
         self._assert_mysql_is_ok()
-        LOG.debug("Mysql is good, too.")
+        LOG.debug("Mysql is good, too for instance: %s" % self.instance.id)
 
     def _confirm_nova_action(self):
         LOG.debug("Instance %s calling Compute confirm resize..."
@@ -692,22 +727,30 @@ class ResizeActionBase(ConfigurationMixin):
         """Calls Nova to resize or migrate an instance, and confirms."""
         need_to_revert = False
         try:
-            LOG.debug("Initiating nova action")
+            LOG.debug("Initiating nova action",
+                      instance_uuid=self.instance.id)
             self._initiate_nova_action()
-            LOG.debug("Waiting for nova action")
+            LOG.debug("Waiting for nova action",
+                      instance_uuid=self.instance.id)
             self._wait_for_nova_action()
-            LOG.debug("Asserting nova status is ok")
+            LOG.debug("Asserting nova status is ok",
+                      instance_uuid=self.instance.id)
             self._assert_nova_status_is_ok()
             need_to_revert = True
-            LOG.debug("* * * REVERT BARRIER PASSED * * *")
-            LOG.debug("Asserting nova action success")
+            LOG.debug("* * * REVERT BARRIER PASSED * * *",
+                      instance_uuid=self.instance.id)
+            LOG.debug("Asserting nova action success",
+                      instance_uuid=self.instance.id)
             self._assert_nova_action_was_successful()
-            LOG.debug("Asserting processes are OK")
+            LOG.debug("Asserting processes are OK",
+                      instance_uuid=self.instance.id)
             self._assert_processes_are_ok()
-            LOG.debug("Confirming nova action")
+            LOG.debug("Confirming nova action",
+                      instance_uuid=self.instance.id)
             self._confirm_nova_action()
         except Exception as ex:
-            LOG.exception("Exception during nova action.")
+            LOG.exception("Exception during nova action.",
+                          instance_uuid=self.instance.id)
             if need_to_revert:
                 LOG.error("Reverting action for instance %s" %
                           self.instance.id)
@@ -715,16 +758,18 @@ class ResizeActionBase(ConfigurationMixin):
                 self._wait_for_revert_nova_action()
 
             if self.instance.server.status == 'ACTIVE':
-                LOG.error("Restarting MySQL.")
+                LOG.error("Restarting MySQL.", instance_uuid=self.instance.id)
                 self.instance.guest.restart()
             else:
-                LOG.error("Can not restart MySQL because "
-                          "Nova server status is not ACTIVE")
+                LOG.error("Can not restart MySQL on instance %s because "
+                          "Nova server status is not ACTIVE" %
+                          self.instance.id, instance_uuid=self.instance.id)
 
-            LOG.error("Error resizing instance %s." % self.instance.id)
+            LOG.error("Error resizing instance %s." % self.instance.id,
+                      instance_uuid=self.instance.id)
             raise ex
 
-        LOG.debug("Recording success")
+        LOG.debug("Recording success", instance_uuid=self.instance.id)
         self._record_action_success()
 
     def _wait_for_nova_action(self):
@@ -760,8 +805,10 @@ class ResizeAction(ResizeActionBase):
     def _assert_nova_action_was_successful(self):
         # Do check to make sure the status and flavor id are correct.
         if str(self.instance.server.flavor['id']) != str(self.new_flavor_id):
-            msg = "Assertion failed! flavor_id=%s and not %s" \
-                  % (self.instance.server.flavor['id'], self.new_flavor_id)
+            msg = "Assertion failed! instance %s flavor_id=%s and not %s" \
+                  % (self.instance.id,
+                     self.instance.server.flavor['id'],
+                     self.new_flavor_id)
             raise TroveError(msg)
 
     def _initiate_nova_action(self):
@@ -769,16 +816,17 @@ class ResizeAction(ResizeActionBase):
 
     def _revert_nova_action(self):
         LOG.debug("Instance %s calling Compute revert resize..."
-                  % self.instance.id)
-        LOG.debug("Repairing config.")
+                  % self.instance.id, instance_uuid=self.instance.id)
+        LOG.debug("Repairing config.", instance_uuid=self.instance.id)
         try:
             config = self._render_config(self.instance.service_type,
                                          self.old_flavor)
             config = {'config_contents': config.config_contents}
             self.instance.guest.reset_configuration(config)
         except GuestTimeout as gt:
-            LOG.exception("Error sending reset_configuration call.")
-        LOG.debug("Reverting resize.")
+            LOG.exception("Error sending reset_configuration call.",
+                          instance_uuid=self.instance.id)
+        LOG.debug("Reverting resize.", instance_uuid=self.instance.id)
         super(ResizeAction, self)._revert_nova_action()
 
     def _record_action_success(self):
@@ -804,17 +852,20 @@ class MigrateAction(ResizeActionBase):
         self.host = host
 
     def _assert_nova_action_was_successful(self):
-        LOG.debug("Currently no assertions for a Migrate Action")
+        LOG.debug("Currently no assertions for a Migrate Action",
+                  instance_uuid=self.instance.id)
 
     def _initiate_nova_action(self):
         LOG.debug("Migrating instance %s without flavor change ..."
-                  % self.instance.id)
-        LOG.debug("Forcing migration to host(%s)" % self.host)
+                  % self.instance.id, instance_uuid=self.instance.id)
+        LOG.debug("Forcing migration to host(%s)" % self.host,
+                  instance_uuid=self.instance.id)
         self.instance.server.migrate(force_host=self.host)
 
     def _record_action_success(self):
         LOG.debug("Successfully finished Migration to %s: %s" %
-                  (self.instance.hostname, self.instance.id))
+                  (self.instance.hostname, self.instance.id),
+                  instance_uuid=self.instance.id)
 
     def _start_mysql(self):
         self.instance.guest.restart()
